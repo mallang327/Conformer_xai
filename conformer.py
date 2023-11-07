@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from functools import partial
 
 from timm.models.layers import DropPath, trunc_normal_
+import pdb
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -112,7 +113,10 @@ class ConvBlock(nn.Module):
         if self.drop_block is not None:
             x = self.drop_block(x)
         x = self.act1(x)
-
+        # x_t: torch.Size([1, 16, 56, 40]) & x: torch.Size([1, 16, 56, 43])
+        if x_t is not None:
+            if x_t.shape != x.shape:
+                x_t = F.interpolate(x_t, size=(x.shape[2], x.shape[3]))
         x = self.conv2(x) if x_t is None else self.conv2(x + x_t)
         x = self.bn2(x)
         if self.drop_block is not None:
@@ -156,13 +160,13 @@ class FCUDown(nn.Module):
         self.act = act_layer()
 
     def forward(self, x, x_t):
-        x = self.conv_project(x)  # [N, C, H, W]
+        x = self.conv_project(x)  # [N, C, H, W] --> [N, embed_dim(384), H(56), W(56인데 test는 달라)]
 
-        x = self.sample_pooling(x).flatten(2).transpose(1, 2)
+        x = self.sample_pooling(x).flatten(2).transpose(1, 2) # [N, C, H, W] -> [N, C, (H//4)*(W//4)] -> [N, (H//4)*(W//4), C]
         x = self.ln(x)
         x = self.act(x)
 
-        x = torch.cat([x_t[:, 0][:, None, :], x], dim=1)
+        x = torch.cat([x_t[:, 0][:, None, :], x], dim=1) # [N, (H//4)*(W//4), C] -> [N, (H//4)*(W//4)+1, C]
 
         return x
 
@@ -183,7 +187,10 @@ class FCUUp(nn.Module):
     def forward(self, x, H, W):
         B, _, C = x.shape
         # [N, 197, 384] -> [N, 196, 384] -> [N, 384, 196] -> [N, 384, 14, 14]
-        x_r = x[:, 1:].transpose(1, 2).reshape(B, C, H, W)
+        try:
+            x_r = x[:, 1:].transpose(1, 2).reshape(B, C, H, W)
+        except:
+            pdb.set_trace()
         x_r = self.act(self.bn(self.conv_project(x_r)))
 
         return F.interpolate(x_r, size=(H * self.up_stride, W * self.up_stride))
@@ -290,8 +297,13 @@ class ConvTransBlock(nn.Module):
         _, _, H, W = x2.shape
 
         x_st = self.squeeze_block(x2, x_t)
-
+        # x_st: torch.Size([1,155,384]) & x_t: torch.Size([1,141,384])
+        
+        if x_st.shape != x_t.shape:
+            #x_st = F.interpolate(x_st.unsqueeze(0), size=(x_t.unsqueeze(0).shape[2], x_t.unsqueeze(0).shape[3])).squeeze(0)
+            x_t = F.interpolate(x_t.unsqueeze(0), size=(x_st.unsqueeze(0).shape[2], x_st.unsqueeze(0).shape[3])).squeeze(0)
         x_t = self.trans_block(x_st + x_t)
+
 
         if self.num_med_block > 0:
             for m in self.med_block:
@@ -307,7 +319,8 @@ class Conformer(nn.Module):
 
     def __init__(self, patch_size=16, in_chans=3, num_classes=1000, base_channel=64, channel_ratio=4, num_med_block=0,
                  embed_dim=768, depth=12, num_heads=12, mlp_ratio=4., qkv_bias=False, qk_scale=None,
-                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.):
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0., 
+                 pretrained_cfg=None, pretrained_cfg_overlay=None):
 
         # Transformer
         super().__init__()
@@ -331,7 +344,7 @@ class Conformer(nn.Module):
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)  # 1 / 4 [56, 56]
 
         # 1 stage
-        stage_1_channel = int(base_channel * channel_ratio)
+        stage_1_channel = int(base_channel * channel_ratio) # tiny: channel_ratio = 1
         trans_dw_stride = patch_size // 4
         self.conv_1 = ConvBlock(inplanes=64, outplanes=stage_1_channel, res_conv=True, stride=1)
         self.trans_patch_conv = nn.Conv2d(64, embed_dim, kernel_size=trans_dw_stride, stride=trans_dw_stride, padding=0)
@@ -416,30 +429,62 @@ class Conformer(nn.Module):
 
 
     def forward(self, x):
+        #print(f"-- Conformer start --")
+        #print(f"x: {x.shape}")
+
+        # When an input is 1-channel (Not RGB)
+        if x.shape[1] == 1:
+            x = x.expand(x.shape[0], 3, x.shape[2], x.shape[3])
+            #print(f"[1ch to 3ch] x: {x.shape}")
+
         B = x.shape[0]
         cls_tokens = self.cls_token.expand(B, -1, -1)
+        #print(f"self.cls_token: {self.cls_token.shape}")
+        #print(f"cls_tokens(self.cls_token.expand(B, -1, -1)): {cls_tokens.shape}")
+        
 
         # pdb.set_trace()
         # stem stage [N, 3, 224, 224] -> [N, 64, 56, 56]
         x_base = self.maxpool(self.act1(self.bn1(self.conv1(x))))
+        #print(f"\nStem stage")
+        #print(f"x_base: {x.shape}")
 
         # 1 stage
+        #print(f"\n1 stage")
         x = self.conv_1(x_base, return_x_2=False)
 
+        #print(f"[CNN] After conv_1, x: {x.shape}")
+
         x_t = self.trans_patch_conv(x_base).flatten(2).transpose(1, 2)
+
+        #print(f"[Trans] After trans_path, x_t: {x_t.shape}")
+
         x_t = torch.cat([cls_tokens, x_t], dim=1)
+
+        #print(f"[Trans] After torch.cat, x_t: {x_t.shape}")
+
         x_t = self.trans_1(x_t)
         
+        #print(f"[Trans] After trans_1, x_t: {x_t.shape}\n")
+
         # 2 ~ final 
+        #print(f"-- Conv_trans Stage --")
         for i in range(2, self.fin_stage):
             x, x_t = eval('self.conv_trans_' + str(i))(x, x_t)
 
-        # conv classification
+            #print(f"stage: {i}, x: {x.shape} x_t: {x_t.shape}")
+
+        #print(f"\n-- Classification Stage --")
+        # conv classification        
         x_p = self.pooling(x).flatten(1)
+        #print(f"[CNN] After pooling, x_p: {x_p.shape}")
         conv_cls = self.conv_cls_head(x_p)
+        #print(f"[CNN] After cls_head, conv_cls: {conv_cls.shape}")
 
         # trans classification
         x_t = self.trans_norm(x_t)
+        #print(f"[Trans] After trans_norm, x_t: {x_t.shape}")
         tran_cls = self.trans_cls_head(x_t[:, 0])
-
+        #print(f"[Trans] After cls_head, trans_cls: {tran_cls.shape}")
+        #pdb.set_trace()
         return [conv_cls, tran_cls]
